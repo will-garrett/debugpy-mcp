@@ -379,3 +379,71 @@ class DAPSession:
                     bp.verified = dap_bp.get("verified", False)
             except Exception:
                 pass
+
+
+import subprocess as _subprocess
+
+COMMON_REMOTE_ROOTS = ["/app", "/code", "/srv", "/workspace", "/home/app"]
+
+
+def detect_path_mappings(
+    session: DAPSession,
+    container: str | None,
+    timeout: float = 10.0,
+) -> tuple[list[PathMapping], list[str]]:
+    """
+    Try to auto-detect path mappings.
+
+    Strategy 1 (Docker-based, requires container name): read /proc/1/cwd.
+    Strategy 2 (DAP-based, requires stopped process): evaluate os.getcwd() via DAP repl.
+
+    Returns (mappings, notes).
+    """
+    notes: list[str] = []
+    local_root = os.getcwd()
+
+    # Strategy 1: Docker-based
+    if container:
+        try:
+            proc = _subprocess.run(
+                ["docker", "exec", container, "sh", "-lc", "readlink /proc/1/cwd 2>/dev/null || cat /proc/1/cwd 2>/dev/null"],
+                capture_output=True, text=True, timeout=10,
+            )
+            remote_root = proc.stdout.strip()
+            if not remote_root:
+                # Try common roots
+                for root in COMMON_REMOTE_ROOTS:
+                    check = _subprocess.run(
+                        ["docker", "exec", container, "sh", "-lc", f"test -d {root} && echo yes"],
+                        capture_output=True, text=True, timeout=5,
+                    )
+                    if check.stdout.strip() == "yes":
+                        remote_root = root
+                        break
+            if remote_root:
+                notes.append(f"Auto-detected via Docker: {local_root} → {remote_root}")
+                return [PathMapping(local_root, remote_root)], notes
+            notes.append("Docker-based detection found no working directory; falling through to DAP strategy.")
+        except Exception as exc:
+            notes.append(f"Docker-based detection failed ({exc}); falling through to DAP strategy.")
+
+    # Strategy 2: DAP evaluate (only works if process is stopped)
+    try:
+        resp = session._request("evaluate", {
+            "expression": "__import__('os').getcwd()",
+            "context": "repl",
+        }, timeout=timeout)
+        if resp.get("success"):
+            remote_root = resp.get("body", {}).get("result", "").strip("'\"")
+            if remote_root:
+                notes.append(f"Auto-detected via DAP: {local_root} → {remote_root}")
+                return [PathMapping(local_root, remote_root)], notes
+    except Exception:
+        pass
+
+    notes.append(
+        "Auto-detection could not determine path mappings. "
+        "Process may be running (not stopped). "
+        "Provide path_mappings manually or call debugpy_session_start again after hitting a breakpoint."
+    )
+    return [], notes
