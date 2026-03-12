@@ -102,3 +102,75 @@ class DAPSession:
         with self._state_lock:
             self._seq += 1
             return self._seq
+
+    # ------------------------------------------------------------------
+    # Message framing
+    # ------------------------------------------------------------------
+
+    def _send_msg(self, msg: dict[str, Any]) -> None:
+        """Encode and send one DAP message. Called from tool-call threads."""
+        body = json.dumps(msg).encode()
+        frame = f"Content-Length: {len(body)}\r\n\r\n".encode() + body
+        assert self._sock is not None
+        self._sock.sendall(frame)
+
+    def _read_msg_raw(self) -> dict[str, Any]:
+        """Read one complete DAP message from the socket. Called ONLY from reader thread."""
+        assert self._sock is not None
+        while b"\r\n\r\n" not in self._buf:
+            chunk = self._sock.recv(4096)
+            if not chunk:
+                raise ConnectionError("DAP socket closed")
+            self._buf += chunk
+        sep = self._buf.index(b"\r\n\r\n")
+        header_bytes, self._buf = self._buf[:sep], self._buf[sep + 4:]
+        length = int(
+            next(
+                line.split(":", 1)[1].strip()
+                for line in header_bytes.decode().split("\r\n")
+                if line.lower().startswith("content-length")
+            )
+        )
+        while len(self._buf) < length:
+            chunk = self._sock.recv(4096)
+            if not chunk:
+                raise ConnectionError("DAP socket closed")
+            self._buf += chunk
+        body, self._buf = self._buf[:length], self._buf[length:]
+        return json.loads(body)
+
+    # ------------------------------------------------------------------
+    # Background reader thread
+    # ------------------------------------------------------------------
+
+    def _reader_loop(self) -> None:
+        """Runs in a background thread. Routes responses to callers and events to queue."""
+        try:
+            while not self._reader_stop.is_set():
+                try:
+                    msg = self._read_msg_raw()
+                except (ConnectionError, OSError, StopIteration, ValueError):
+                    break
+                msg_type = msg.get("type")
+                if msg_type == "response":
+                    seq = msg.get("request_seq")
+                    with self._pending_lock:
+                        q = self._pending.get(seq)
+                    if q is not None:
+                        q.put(msg)
+                elif msg_type == "event":
+                    event = msg.get("event")
+                    if event == "stopped":
+                        thread_id = msg.get("body", {}).get("threadId")
+                        with self._state_lock:
+                            self.stopped_thread_id = thread_id
+                    # Skip internal DAP housekeeping events that are not useful to tools
+                    if event not in ("initialized", "process", "module", "loadedSource"):
+                        self._event_queue.put(msg)
+        finally:
+            self._set_connected(False)
+
+    def _start_reader(self) -> None:
+        self._reader_stop.clear()
+        self._reader = threading.Thread(target=self._reader_loop, daemon=True, name=f"dap-reader-{self.host}:{self.port}")
+        self._reader.start()
