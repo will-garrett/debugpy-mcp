@@ -232,6 +232,7 @@ class DAPSession:
                 self.disconnect()
             self.connect()
             self.handshake(timeout=timeout)
+            self._resync_breakpoints(timeout=timeout)
             return
         # persist mode: reconnect if dropped
         if not self.connected:
