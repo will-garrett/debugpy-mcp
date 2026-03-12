@@ -174,3 +174,100 @@ class DAPSession:
         self._reader_stop.clear()
         self._reader = threading.Thread(target=self._reader_loop, daemon=True, name=f"dap-reader-{self.host}:{self.port}")
         self._reader.start()
+
+    # ------------------------------------------------------------------
+    # Request / response
+    # ------------------------------------------------------------------
+
+    def _request(self, command: str, arguments: dict[str, Any] | None = None, timeout: float = 30.0) -> dict[str, Any]:
+        """Send a DAP request and block until the matching response arrives."""
+        seq = self._next_seq()
+        response_queue: queue.Queue[dict[str, Any]] = queue.Queue()
+        with self._pending_lock:
+            self._pending[seq] = response_queue
+        msg: dict[str, Any] = {"seq": seq, "type": "request", "command": command}
+        if arguments is not None:
+            msg["arguments"] = arguments
+        self._send_msg(msg)
+        try:
+            return response_queue.get(timeout=timeout)
+        except queue.Empty:
+            raise TimeoutError(f"DAP '{command}' request timed out after {timeout}s")
+        finally:
+            with self._pending_lock:
+                self._pending.pop(seq, None)
+
+    # ------------------------------------------------------------------
+    # Connection lifecycle
+    # ------------------------------------------------------------------
+
+    def connect(self, timeout: float = 10.0) -> None:
+        """Open the TCP socket and start the reader thread."""
+        self._buf = b""
+        self._sock = socket.create_connection((self.host, self.port), timeout=timeout)
+        self._sock.settimeout(None)  # blocking reads in reader thread
+        self._start_reader()
+        self._set_connected(True)
+
+    def disconnect(self, terminate_debuggee: bool = False) -> None:
+        """Send DAP disconnect and close the socket."""
+        if self._sock is not None:
+            try:
+                self._request("disconnect", {"restart": False, "terminateDebuggee": terminate_debuggee}, timeout=5.0)
+            except Exception:
+                pass
+        self._reader_stop.set()
+        if self._sock is not None:
+            try:
+                self._sock.close()
+            except Exception:
+                pass
+            self._sock = None
+        self._set_connected(False)
+
+    def ensure_connected(self, timeout: float = 30.0) -> None:
+        """Ensure a live connection exists. In ephemeral mode, always reconnects."""
+        if self.method == "ephemeral":
+            if self._sock is not None:
+                self.disconnect()
+            self.connect()
+            self.handshake(timeout=timeout)
+            return
+        # persist mode: reconnect if dropped
+        if not self.connected:
+            self.connect()
+            self.handshake(timeout=timeout)
+            self._resync_breakpoints(timeout=timeout)
+
+    def ensure_disconnected_if_ephemeral(self) -> None:
+        """In ephemeral mode, disconnect after each tool call."""
+        if self.method == "ephemeral":
+            self.disconnect()
+
+    # ------------------------------------------------------------------
+    # Handshake
+    # ------------------------------------------------------------------
+
+    def handshake(self, timeout: float = 30.0) -> None:
+        """Perform the DAP initialize → attach → configurationDone sequence."""
+        init_resp = self._request("initialize", {
+            "clientID": "debugpy-mcp",
+            "clientName": "debugpy-mcp",
+            "adapterID": "debugpy",
+            "linesStartAt1": True,
+            "columnsStartAt1": True,
+            "pathFormat": "path",
+            "supportsVariableType": True,
+            "supportsEvaluateForHovers": True,
+        }, timeout=timeout)
+        if not init_resp.get("success"):
+            raise ConnectionError(f"DAP initialize failed: {init_resp.get('message', init_resp)}")
+
+        attach_resp = self._request("attach", {
+            "justMyCode": False,
+            "subProcess": False,
+        }, timeout=timeout)
+        if not attach_resp.get("success"):
+            raise ConnectionError(f"DAP attach failed: {attach_resp.get('message', attach_resp)}")
+
+        self._request("configurationDone", timeout=timeout)
