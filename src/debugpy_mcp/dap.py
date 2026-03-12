@@ -6,6 +6,7 @@ import os
 import queue
 import socket
 import threading
+import time
 import uuid
 from typing import Any, Literal
 
@@ -71,6 +72,9 @@ class DAPSession:
         self._pending: dict[int, queue.Queue[dict[str, Any]]] = {}
         self._pending_lock = threading.Lock()
 
+        # Serializes concurrent sendall calls from multiple tool-call threads
+        self._send_lock = threading.Lock()
+
         # Async event queue (stopped, output, breakpoint, etc.)
         self._event_queue: queue.Queue[dict[str, Any]] = queue.Queue()
 
@@ -111,12 +115,15 @@ class DAPSession:
         """Encode and send one DAP message. Called from tool-call threads."""
         body = json.dumps(msg).encode()
         frame = f"Content-Length: {len(body)}\r\n\r\n".encode() + body
-        assert self._sock is not None
-        self._sock.sendall(frame)
+        if self._sock is None:
+            raise RuntimeError("DAP socket is not connected")
+        with self._send_lock:
+            self._sock.sendall(frame)
 
     def _read_msg_raw(self) -> dict[str, Any]:
         """Read one complete DAP message from the socket. Called ONLY from reader thread."""
-        assert self._sock is not None
+        if self._sock is None:
+            raise RuntimeError("DAP socket is not connected")
         while b"\r\n\r\n" not in self._buf:
             chunk = self._sock.recv(4096)
             if not chunk:
@@ -277,19 +284,27 @@ class DAPSession:
     # Stopped state resolution
     # ------------------------------------------------------------------
 
-    def _sync_stopped_state(self, timeout: float = 5.0) -> None:
-        """Drain any pending stopped events and update stopped_thread_id / stopped_frame_id."""
-        # Drain events without blocking if the queue is empty
-        while True:
-            try:
-                event = self._event_queue.get_nowait()
-            except queue.Empty:
-                break
-            if event.get("event") == "stopped":
-                thread_id = event.get("body", {}).get("threadId")
-                if thread_id is not None:
-                    with self._state_lock:
-                        self.stopped_thread_id = thread_id
+    def _sync_stopped_state(self, timeout: float = 5.0, drain_queue: bool = True) -> None:
+        """Update stopped_thread_id / stopped_frame_id.
+
+        When drain_queue=True (default), also drains pending stopped events from the
+        event queue (used by _require_session to pick up spontaneous breakpoint hits).
+        When drain_queue=False, skips the drain and only fetches the top frame for the
+        already-recorded stopped_thread_id (used by wait_for_stop, which has already
+        set stopped_thread_id from the authoritative event).
+        """
+        if drain_queue:
+            # Drain events without blocking if the queue is empty
+            while True:
+                try:
+                    event = self._event_queue.get_nowait()
+                except queue.Empty:
+                    break
+                if event.get("event") == "stopped":
+                    thread_id = event.get("body", {}).get("threadId")
+                    if thread_id is not None:
+                        with self._state_lock:
+                            self.stopped_thread_id = thread_id
 
         # If we have a stopped thread, fetch the top frame
         with self._state_lock:
@@ -310,7 +325,6 @@ class DAPSession:
         Collects non-stopped events in a local buffer and re-enqueues them after
         the loop exits, avoiding a busy-wait spin on a non-empty queue.
         """
-        import time
         deadline = time.monotonic() + timeout
         non_stopped: list[dict[str, Any]] = []
         result: dict[str, Any] | None = None
@@ -336,7 +350,9 @@ class DAPSession:
             thread_id = result.get("body", {}).get("threadId")
             with self._state_lock:
                 self.stopped_thread_id = thread_id
-            self._sync_stopped_state(timeout=5.0)
+            # drain_queue=False: stopped_thread_id already set from authoritative event above;
+            # draining would risk overwriting it with a stale queued stopped event.
+            self._sync_stopped_state(timeout=5.0, drain_queue=False)
         return result
 
     # ------------------------------------------------------------------
