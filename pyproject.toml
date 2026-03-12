@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "debugpy-mcp"
+version = "0.2.0"
+description = "Enhanced MCP server for attaching debugpy to running Python processes in Docker containers"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "mcp>=1.2.0",
+  "pydantic>=2.7.0",
+]
+
+[project.scripts]
+debugpy-mcp = "debugpy_mcp.server:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
