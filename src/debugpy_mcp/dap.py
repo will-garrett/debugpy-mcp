@@ -271,3 +271,111 @@ class DAPSession:
             raise ConnectionError(f"DAP attach failed: {attach_resp.get('message', attach_resp)}")
 
         self._request("configurationDone", timeout=timeout)
+
+    # ------------------------------------------------------------------
+    # Stopped state resolution
+    # ------------------------------------------------------------------
+
+    def _sync_stopped_state(self, timeout: float = 5.0) -> None:
+        """Drain any pending stopped events and update stopped_thread_id / stopped_frame_id."""
+        # Drain events without blocking if the queue is empty
+        while True:
+            try:
+                event = self._event_queue.get_nowait()
+            except queue.Empty:
+                break
+            if event.get("event") == "stopped":
+                thread_id = event.get("body", {}).get("threadId")
+                if thread_id is not None:
+                    with self._state_lock:
+                        self.stopped_thread_id = thread_id
+
+        # If we have a stopped thread, fetch the top frame
+        with self._state_lock:
+            thread_id = self.stopped_thread_id
+        if thread_id is not None:
+            try:
+                resp = self._request("stackTrace", {"threadId": thread_id, "startFrame": 0, "levels": 1}, timeout=timeout)
+                frames = resp.get("body", {}).get("stackFrames", [])
+                if frames:
+                    with self._state_lock:
+                        self.stopped_frame_id = frames[0]["id"]
+            except Exception:
+                pass
+
+    def wait_for_stop(self, timeout: float = 30.0) -> dict[str, Any] | None:
+        """Block until a stopped event arrives (used by step/pause tools).
+
+        Collects non-stopped events in a local buffer and re-enqueues them after
+        the loop exits, avoiding a busy-wait spin on a non-empty queue.
+        """
+        import time
+        deadline = time.monotonic() + timeout
+        non_stopped: list[dict[str, Any]] = []
+        result: dict[str, Any] | None = None
+        try:
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                try:
+                    event = self._event_queue.get(timeout=min(remaining, 1.0))
+                except queue.Empty:
+                    continue
+                if event.get("event") == "stopped":
+                    result = event
+                    break
+                # Not a stopped event — buffer it to re-enqueue later
+                non_stopped.append(event)
+        finally:
+            for e in non_stopped:
+                self._event_queue.put(e)
+
+        if result is not None:
+            thread_id = result.get("body", {}).get("threadId")
+            with self._state_lock:
+                self.stopped_thread_id = thread_id
+            self._sync_stopped_state(timeout=5.0)
+        return result
+
+    # ------------------------------------------------------------------
+    # Path mapping helpers
+    # ------------------------------------------------------------------
+
+    def to_remote_path(self, local_path: str) -> str:
+        for m in self.path_mappings:
+            remote = m.to_remote(local_path)
+            if remote != local_path:
+                return remote
+        return local_path
+
+    def to_local_path(self, remote_path: str) -> str:
+        for m in self.path_mappings:
+            local = m.to_local(remote_path)
+            if local != remote_path:
+                return local
+        return remote_path
+
+    # ------------------------------------------------------------------
+    # Breakpoint re-sync (called after reconnect)
+    # ------------------------------------------------------------------
+
+    def _resync_breakpoints(self, timeout: float = 30.0) -> None:
+        """Re-send all registered breakpoints to DAP after reconnect."""
+        files: dict[str, list[DAPBreakpoint]] = {}
+        for bp in self.breakpoints:
+            files.setdefault(bp.file, []).append(bp)
+        for local_file, bps in files.items():
+            remote_file = self.to_remote_path(local_file)
+            source_bps = [{"line": bp.line, **({"condition": bp.condition} if bp.condition else {})} for bp in bps]
+            try:
+                resp = self._request("setBreakpoints", {
+                    "source": {"path": remote_file},
+                    "breakpoints": source_bps,
+                }, timeout=timeout)
+                dap_bps = resp.get("body", {}).get("breakpoints", [])
+                for bp, dap_bp in zip(bps, dap_bps):
+                    bp.dap_id = dap_bp.get("id")
+                    bp.verified = dap_bp.get("verified", False)
+            except Exception:
+                pass
