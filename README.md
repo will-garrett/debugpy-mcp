@@ -26,19 +26,58 @@ An enhanced MCP server for Cursor that helps an agent attach `debugpy` to an alr
 
 ## Install
 
+### pip / venv
+
 ```bash
 python -m venv .venv
 source .venv/bin/activate
 pip install -e .
 ```
 
+### uv
+
+```bash
+uv venv
+uv pip install -e .
+```
+
+Or install directly without cloning:
+
+```bash
+uv tool install debugpy-mcp
+```
+
+### Poetry
+
+```bash
+poetry install
+```
+
 ## Run manually
+
+### pip / venv
 
 ```bash
 debugpy-mcp
 ```
 
+### uv
+
+```bash
+uv run debugpy-mcp
+```
+
+### Poetry
+
+```bash
+poetry run debugpy-mcp
+```
+
 ## Cursor MCP config
+
+Cursor reads MCP server config from `~/.cursor/mcp.json` (global) or `.cursor/mcp.json` (project-local).
+
+### pip / venv
 
 ```json
 {
@@ -51,14 +90,70 @@ debugpy-mcp
 }
 ```
 
-Or:
+### uv (recommended)
+
+If you installed with `uv tool install`, `uvx` can run the server without activating an environment:
 
 ```json
 {
   "mcpServers": {
     "debugpy-docker": {
-      "command": "/absolute/path/to/debugpy-mcp/.venv/bin/python",
-      "args": ["-m", "debugpy_mcp.server"]
+      "command": "uvx",
+      "args": ["debugpy-mcp"]
+    }
+  }
+}
+```
+
+If you installed with `uv pip install -e .` into a project venv, point directly at the binary:
+
+```json
+{
+  "mcpServers": {
+    "debugpy-docker": {
+      "command": "/absolute/path/to/debugpy-mcp/.venv/bin/debugpy-mcp",
+      "args": []
+    }
+  }
+}
+```
+
+Or run via `uv run` from the project directory:
+
+```json
+{
+  "mcpServers": {
+    "debugpy-docker": {
+      "command": "uv",
+      "args": ["--directory", "/absolute/path/to/debugpy-mcp", "run", "debugpy-mcp"]
+    }
+  }
+}
+```
+
+### Poetry
+
+Poetry manages its own virtualenv. Use `poetry run` so Cursor doesn't need to know the venv path:
+
+```json
+{
+  "mcpServers": {
+    "debugpy-docker": {
+      "command": "poetry",
+      "args": ["--directory", "/absolute/path/to/debugpy-mcp", "run", "debugpy-mcp"]
+    }
+  }
+}
+```
+
+Alternatively, find the venv path with `poetry env info --path` and reference the binary directly:
+
+```json
+{
+  "mcpServers": {
+    "debugpy-docker": {
+      "command": "/path/from/poetry-env-info/bin/debugpy-mcp",
+      "args": []
     }
   }
 }
