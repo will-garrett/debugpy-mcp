@@ -1,3 +1,12 @@
+Metadata-Version: 2.4
+Name: debugpy-mcp
+Version: 0.2.0
+Summary: Enhanced MCP server for attaching debugpy to running Python processes in Docker containers
+Requires-Python: >=3.11
+Description-Content-Type: text/markdown
+Requires-Dist: mcp>=1.2.0
+Requires-Dist: pydantic>=2.7.0
+
 # debugpy-mcp
 
 An enhanced MCP server for Cursor that helps an agent attach `debugpy` to an already-running Python process inside a Docker container, inspect context, retrieve logs, and suggest breakpoint plans for FastAPI-style services.
@@ -15,7 +24,6 @@ An enhanced MCP server for Cursor that helps an agent attach `debugpy` to an alr
 
 ## Tools
 
-- `debugpy_connect` — check if debugpy is already listening at a host:port (no Docker required)
 - `debugpy_list_containers`
 - `debugpy_autodiscover_target`
 - `debugpy_status`

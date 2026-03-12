@@ -1,0 +1,10 @@
+README.md
+pyproject.toml
+src/debugpy_mcp/__init__.py
+src/debugpy_mcp/server.py
+src/debugpy_mcp.egg-info/PKG-INFO
+src/debugpy_mcp.egg-info/SOURCES.txt
+src/debugpy_mcp.egg-info/dependency_links.txt
+src/debugpy_mcp.egg-info/entry_points.txt
+src/debugpy_mcp.egg-info/requires.txt
+src/debugpy_mcp.egg-info/top_level.txt

@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import re
 import shlex
+import socket
 import subprocess
 from typing import Any, Literal
 
@@ -562,6 +563,53 @@ def debugpy_breakpoint_plan(container: str, tail: int = 250, python_bin: str = "
     plan = build_breakpoint_plan(logs, processes, working_dir)
     plan.container = container
     return plan.model_dump()
+
+
+class ConnectResult(BaseModel):
+    ok: bool
+    host: str
+    port: int
+    listening: bool
+    notes: list[str] = Field(default_factory=list)
+    next_steps: list[str] = Field(default_factory=list)
+
+
+def tcp_is_listening(host: str, port: int, timeout: float = 5.0) -> bool:
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+@mcp.tool()
+def debugpy_connect(host: str = "localhost", port: int = DEFAULT_PORT) -> dict[str, Any]:
+    """Check whether debugpy is already listening at host:port and return IDE connection details.
+
+    Use this when debugpy is already running (e.g. the process was started with --wait-for-client
+    or you injected it manually) and you just need to verify connectivity and get the attach config.
+    No Docker access is required.
+    """
+    listening = tcp_is_listening(host, port)
+    notes: list[str] = []
+    next_steps: list[str] = []
+
+    if listening:
+        notes.append(f"debugpy is listening at {host}:{port}.")
+        next_steps = [
+            f'Use "host": "{host}", "port": {port} in your IDE attach configuration.',
+            "Ensure your pathMappings map your local source root to the remote container path.",
+            "Start the Attach debug configuration in Cursor / VS Code.",
+        ]
+    else:
+        notes.append(f"Nothing is listening at {host}:{port}.")
+        next_steps = [
+            "Verify the process was started with debugpy (e.g. python -m debugpy --listen 0.0.0.0:5678 ...).",
+            "Check that the port is exposed / forwarded if the process is inside a container.",
+            "If you need to inject debugpy into a running process, use debugpy_attach instead.",
+        ]
+
+    return ConnectResult(ok=listening, host=host, port=port, listening=listening, notes=notes, next_steps=next_steps).model_dump()
 
 
 def main() -> None:
