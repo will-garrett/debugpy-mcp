@@ -755,12 +755,16 @@ def debugpy_session_status(host: str = "localhost", port: int = DEFAULT_PORT) ->
             notes=[f"No active session for {host}:{port}. Call debugpy_session_start first."],
         ).model_dump()
     session = _sessions[key]
+    session.ensure_connected()
     session._sync_stopped_state()
+    with session._state_lock:
+        tid = session.stopped_thread_id
+        fid = session.stopped_frame_id
     return SessionStatusResult(
         ok=True, host=host, port=port, method=SESSION_METHOD,
         connected=session.connected,
-        stopped_thread_id=session.stopped_thread_id,
-        stopped_frame_id=session.stopped_frame_id,
+        stopped_thread_id=tid,
+        stopped_frame_id=fid,
         breakpoints=[bp.to_dict() for bp in session.breakpoints],
         path_mappings=[m.to_dict() for m in session.path_mappings],
         notes=[],
@@ -835,12 +839,14 @@ def debugpy_continue(host: str = "localhost", port: int = DEFAULT_PORT, thread_i
     try:
         session = _require_session(host, port)
     except ToolError as exc:
-        return {"ok": False, "notes": [str(exc)]}
+        return ExecControlResult(ok=False, host=host, port=port, command="continue", notes=[str(exc)]).model_dump()
+    with session._state_lock:
+        current_thread_id = session.stopped_thread_id
     args: dict[str, Any] = {}
     if thread_id is not None:
         args["threadId"] = thread_id
-    elif session.stopped_thread_id is not None:
-        args["threadId"] = session.stopped_thread_id
+    elif current_thread_id is not None:
+        args["threadId"] = current_thread_id
     try:
         resp = session._request("continue", args)
         with session._state_lock:
@@ -859,7 +865,8 @@ def _step_tool(host: str, port: int, command: str, thread_id: int | None) -> dic
         session = _require_session(host, port)
     except ToolError as exc:
         return ExecControlResult(ok=False, host=host, port=port, command=command, notes=[str(exc)]).model_dump()
-    tid = thread_id if thread_id is not None else session.stopped_thread_id
+    with session._state_lock:
+        tid = thread_id if thread_id is not None else session.stopped_thread_id
     if tid is None:
         session.ensure_disconnected_if_ephemeral()
         return ExecControlResult(
@@ -973,6 +980,7 @@ def debugpy_remove_breakpoint(
     try:
         _send_breakpoints_for_file(session, affected_file)
     except Exception as exc:
+        session.breakpoints.append(bp)  # rollback: restore breakpoint so it survives next reconnect
         session.ensure_disconnected_if_ephemeral()
         return {"ok": False, "notes": [f"Failed to update breakpoints after removal: {exc}"]}
 
@@ -984,6 +992,9 @@ def debugpy_remove_breakpoint(
 def debugpy_list_breakpoints(host: str = "localhost", port: int = DEFAULT_PORT) -> dict[str, Any]:
     """List all registered breakpoints for this session."""
     try:
+        # _get_session intentionally used here: breakpoints are in-memory state,
+        # no DAP connection needed. ensure_disconnected_if_ephemeral() is omitted
+        # because no connection is established.
         session = _get_session(host, port)
     except ToolError as exc:
         return {"ok": False, "notes": [str(exc)]}
