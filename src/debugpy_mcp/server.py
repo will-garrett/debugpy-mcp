@@ -10,6 +10,8 @@ from typing import Any, Literal
 from mcp.server.fastmcp import FastMCP
 from pydantic import BaseModel, Field
 
+from debugpy_mcp.dap import DAPSession, DAPBreakpoint, PathMapping, detect_path_mappings
+
 
 mcp = FastMCP("debugpy-docker-mcp")
 
@@ -112,6 +114,28 @@ DEFAULT_SHELL = os.getenv("DEBUGPY_MCP_SHELL", "sh")
 DEFAULT_PORT = int(os.getenv("DEBUGPY_MCP_PORT", "5678"))
 DEFAULT_HOST = os.getenv("DEBUGPY_MCP_HOST", "0.0.0.0")
 DEFAULT_DEBUGPY_LOG_DIR = os.getenv("DEBUGPY_MCP_DEBUGPY_LOG_DIR", "/tmp/debugpy-logs")
+
+SESSION_METHOD: Literal["persist", "ephemeral"] = os.getenv("DEBUGPY_MCP_METHOD", "persist")  # type: ignore[assignment]
+_sessions: dict[tuple[str, int], DAPSession] = {}
+
+
+def _get_session(host: str, port: int) -> DAPSession:
+    """Return existing session or raise ToolError."""
+    key = (host, port)
+    if key not in _sessions:
+        raise ToolError(
+            f"No active DAP session for {host}:{port}. "
+            "Call debugpy_session_start first."
+        )
+    return _sessions[key]
+
+
+def _require_session(host: str, port: int) -> DAPSession:
+    """Return session after syncing stopped state."""
+    session = _get_session(host, port)
+    session.ensure_connected()
+    session._sync_stopped_state()
+    return session
 
 
 def run(cmd: list[str], *, timeout: int = DEFAULT_TIMEOUT, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -610,6 +634,506 @@ def debugpy_connect(host: str = "localhost", port: int = DEFAULT_PORT) -> dict[s
         ]
 
     return ConnectResult(ok=listening, host=host, port=port, listening=listening, notes=notes, next_steps=next_steps).model_dump()
+
+
+# ---------------------------------------------------------------------------
+# Session management
+# ---------------------------------------------------------------------------
+
+class SessionStatusResult(BaseModel):
+    ok: bool
+    host: str
+    port: int
+    method: str
+    connected: bool
+    stopped_thread_id: int | None = None
+    stopped_frame_id: int | None = None
+    breakpoints: list[dict] = Field(default_factory=list)
+    path_mappings: list[dict] = Field(default_factory=list)
+    notes: list[str] = Field(default_factory=list)
+
+
+@mcp.tool()
+def debugpy_session_start(
+    host: str = "localhost",
+    port: int = DEFAULT_PORT,
+    path_mappings: list[dict] | None = None,
+    container: str | None = None,
+) -> dict[str, Any]:
+    """Start a DAP session with a running debugpy process.
+
+    path_mappings: list of {"local_root": "...", "remote_root": "..."} dicts.
+    container: Docker container name for Docker-based path auto-detection.
+    If path_mappings is omitted, auto-detection is attempted.
+    IMPORTANT: debugpy accepts only one DAP client at a time.
+    Disconnect any IDE before calling this tool.
+    """
+    key = (host, port)
+    notes: list[str] = []
+
+    # Close any existing session for this key
+    if key in _sessions:
+        try:
+            _sessions[key].disconnect()
+        except Exception:
+            pass
+        del _sessions[key]
+
+    session = DAPSession(host=host, port=port, method=SESSION_METHOD)
+
+    try:
+        session.connect()
+    except ConnectionRefusedError:
+        return SessionStatusResult(
+            ok=False, host=host, port=port, method=SESSION_METHOD, connected=False,
+            notes=[
+                f"Connection refused at {host}:{port}.",
+                "debugpy accepts only one DAP client at a time. Disconnect your IDE first.",
+                "Or verify debugpy is listening: use debugpy_connect to check.",
+            ],
+        ).model_dump()
+    except OSError as exc:
+        return SessionStatusResult(
+            ok=False, host=host, port=port, method=SESSION_METHOD, connected=False,
+            notes=[f"Connection error: {exc}"],
+        ).model_dump()
+
+    try:
+        session.handshake()
+    except ConnectionError as exc:
+        session.disconnect()
+        return SessionStatusResult(
+            ok=False, host=host, port=port, method=SESSION_METHOD, connected=False,
+            notes=[f"DAP handshake failed: {exc}"],
+        ).model_dump()
+
+    # Path mappings
+    if path_mappings:
+        session.path_mappings = [PathMapping(m["local_root"], m["remote_root"]) for m in path_mappings]
+        notes.append(f"Using {len(session.path_mappings)} provided path mapping(s).")
+    else:
+        detected, detect_notes = detect_path_mappings(session, container=container)
+        session.path_mappings = detected
+        notes.extend(detect_notes)
+
+    _sessions[key] = session
+    session._sync_stopped_state()
+    notes.append(f"Session started in '{SESSION_METHOD}' mode.")
+
+    return SessionStatusResult(
+        ok=True, host=host, port=port, method=SESSION_METHOD, connected=True,
+        stopped_thread_id=session.stopped_thread_id,
+        stopped_frame_id=session.stopped_frame_id,
+        breakpoints=[bp.to_dict() for bp in session.breakpoints],
+        path_mappings=[m.to_dict() for m in session.path_mappings],
+        notes=notes,
+    ).model_dump()
+
+
+@mcp.tool()
+def debugpy_session_stop(host: str = "localhost", port: int = DEFAULT_PORT) -> dict[str, Any]:
+    """Cleanly disconnect the DAP session. Does not terminate the debuggee."""
+    key = (host, port)
+    if key not in _sessions:
+        return {"ok": False, "notes": [f"No active session for {host}:{port}."]}
+    try:
+        _sessions[key].disconnect(terminate_debuggee=False)
+    except Exception as exc:
+        return {"ok": False, "notes": [f"Disconnect error: {exc}"]}
+    finally:
+        del _sessions[key]
+    return {"ok": True, "notes": [f"Session {host}:{port} stopped."]}
+
+
+@mcp.tool()
+def debugpy_session_status(host: str = "localhost", port: int = DEFAULT_PORT) -> dict[str, Any]:
+    """Return the current state of a DAP session: connection, stopped position, breakpoints, mappings."""
+    key = (host, port)
+    if key not in _sessions:
+        return SessionStatusResult(
+            ok=False, host=host, port=port, method=SESSION_METHOD, connected=False,
+            notes=[f"No active session for {host}:{port}. Call debugpy_session_start first."],
+        ).model_dump()
+    session = _sessions[key]
+    session._sync_stopped_state()
+    return SessionStatusResult(
+        ok=True, host=host, port=port, method=SESSION_METHOD,
+        connected=session.connected,
+        stopped_thread_id=session.stopped_thread_id,
+        stopped_frame_id=session.stopped_frame_id,
+        breakpoints=[bp.to_dict() for bp in session.breakpoints],
+        path_mappings=[m.to_dict() for m in session.path_mappings],
+        notes=[],
+    ).model_dump()
+
+
+# ---------------------------------------------------------------------------
+# Execution control
+# ---------------------------------------------------------------------------
+
+class ExecControlResult(BaseModel):
+    ok: bool
+    host: str
+    port: int
+    command: str
+    stopped: bool = False
+    stopped_thread_id: int | None = None
+    stopped_frame_id: int | None = None
+    stopped_reason: str | None = None
+    notes: list[str] = Field(default_factory=list)
+
+
+def _exec_control(session: DAPSession, host: str, port: int, command: str, arguments: dict[str, Any]) -> dict[str, Any]:
+    """Shared implementation for execution control tools. Caller is responsible for obtaining the session."""
+    try:
+        resp = session._request(command, arguments)
+    except Exception as exc:
+        session.ensure_disconnected_if_ephemeral()
+        return ExecControlResult(ok=False, host=host, port=port, command=command, notes=[f"DAP error: {exc}"]).model_dump()
+
+    if not resp.get("success"):
+        session.ensure_disconnected_if_ephemeral()
+        return ExecControlResult(
+            ok=False, host=host, port=port, command=command,
+            notes=[resp.get("message", "DAP request failed"), "Thread may no longer be stopped."],
+        ).model_dump()
+
+    # Wait for stopped event (step/pause commands produce one)
+    stopped_event = session.wait_for_stop(timeout=30.0)
+    session.ensure_disconnected_if_ephemeral()
+
+    if stopped_event:
+        reason = stopped_event.get("body", {}).get("reason", "unknown")
+        return ExecControlResult(
+            ok=True, host=host, port=port, command=command, stopped=True,
+            stopped_thread_id=session.stopped_thread_id,
+            stopped_frame_id=session.stopped_frame_id,
+            stopped_reason=reason,
+        ).model_dump()
+    return ExecControlResult(
+        ok=True, host=host, port=port, command=command, stopped=False,
+        notes=["Command sent; no stopped event received within timeout. Process may still be running."],
+    ).model_dump()
+
+
+@mcp.tool()
+def debugpy_pause(host: str = "localhost", port: int = DEFAULT_PORT, thread_id: int | None = None) -> dict[str, Any]:
+    """Pause execution. Defaults to all threads."""
+    try:
+        session = _require_session(host, port)
+    except ToolError as exc:
+        return ExecControlResult(ok=False, host=host, port=port, command="pause", notes=[str(exc)]).model_dump()
+    args: dict[str, Any] = {}
+    if thread_id is not None:
+        args["threadId"] = thread_id
+    return _exec_control(session, host, port, "pause", args)
+
+
+@mcp.tool()
+def debugpy_continue(host: str = "localhost", port: int = DEFAULT_PORT, thread_id: int | None = None) -> dict[str, Any]:
+    """Resume execution."""
+    try:
+        session = _require_session(host, port)
+    except ToolError as exc:
+        return {"ok": False, "notes": [str(exc)]}
+    args: dict[str, Any] = {}
+    if thread_id is not None:
+        args["threadId"] = thread_id
+    elif session.stopped_thread_id is not None:
+        args["threadId"] = session.stopped_thread_id
+    try:
+        resp = session._request("continue", args)
+        with session._state_lock:
+            session.stopped_thread_id = None
+            session.stopped_frame_id = None
+        session.ensure_disconnected_if_ephemeral()
+        return {"ok": resp.get("success", True), "host": host, "port": port, "notes": ["Resumed."]}
+    except Exception as exc:
+        session.ensure_disconnected_if_ephemeral()
+        return {"ok": False, "notes": [f"DAP error: {exc}"]}
+
+
+def _step_tool(host: str, port: int, command: str, thread_id: int | None) -> dict[str, Any]:
+    """Shared wrapper for step_over / step_in / step_out."""
+    try:
+        session = _require_session(host, port)
+    except ToolError as exc:
+        return ExecControlResult(ok=False, host=host, port=port, command=command, notes=[str(exc)]).model_dump()
+    tid = thread_id if thread_id is not None else session.stopped_thread_id
+    if tid is None:
+        session.ensure_disconnected_if_ephemeral()
+        return ExecControlResult(
+            ok=False, host=host, port=port, command=command,
+            notes=["No stopped thread. Use debugpy_pause first or wait for a breakpoint."],
+        ).model_dump()
+    return _exec_control(session, host, port, command, {"threadId": tid})
+
+
+@mcp.tool()
+def debugpy_step_over(host: str = "localhost", port: int = DEFAULT_PORT, thread_id: int | None = None) -> dict[str, Any]:
+    """Step over the current line (DAP 'next')."""
+    return _step_tool(host, port, "next", thread_id)
+
+
+@mcp.tool()
+def debugpy_step_in(host: str = "localhost", port: int = DEFAULT_PORT, thread_id: int | None = None) -> dict[str, Any]:
+    """Step into the next function call (DAP 'stepIn')."""
+    return _step_tool(host, port, "stepIn", thread_id)
+
+
+@mcp.tool()
+def debugpy_step_out(host: str = "localhost", port: int = DEFAULT_PORT, thread_id: int | None = None) -> dict[str, Any]:
+    """Step out of the current function (DAP 'stepOut')."""
+    return _step_tool(host, port, "stepOut", thread_id)
+
+
+# ---------------------------------------------------------------------------
+# Breakpoints
+# ---------------------------------------------------------------------------
+
+def _send_breakpoints_for_file(session: DAPSession, local_file: str, timeout: float = 30.0) -> list[dict]:
+    """Send the full setBreakpoints list for one file. Returns raw DAP breakpoint dicts."""
+    remote_file = session.to_remote_path(local_file)
+    bps_for_file = [bp for bp in session.breakpoints if bp.file == local_file]
+    source_bps = [
+        {"line": bp.line, **({"condition": bp.condition} if bp.condition else {})}
+        for bp in bps_for_file
+    ]
+    resp = session._request("setBreakpoints", {
+        "source": {"path": remote_file},
+        "breakpoints": source_bps,
+    }, timeout=timeout)
+    dap_bps = resp.get("body", {}).get("breakpoints", [])
+    for bp, dap_bp in zip(bps_for_file, dap_bps):
+        bp.dap_id = dap_bp.get("id")
+        bp.verified = dap_bp.get("verified", False)
+    return dap_bps
+
+
+@mcp.tool()
+def debugpy_set_breakpoint(
+    file: str,
+    line: int,
+    host: str = "localhost",
+    port: int = DEFAULT_PORT,
+    condition: str | None = None,
+) -> dict[str, Any]:
+    """Set a breakpoint at file:line. file should be a local path; path mapping is applied automatically.
+
+    Returns a breakpoint ID (use with debugpy_remove_breakpoint).
+    """
+    try:
+        session = _require_session(host, port)
+    except ToolError as exc:
+        return {"ok": False, "notes": [str(exc)]}
+
+    bp = DAPBreakpoint(file=file, line=line, condition=condition)
+    session.breakpoints.append(bp)
+
+    try:
+        _send_breakpoints_for_file(session, file)
+    except Exception as exc:
+        session.breakpoints.remove(bp)
+        session.ensure_disconnected_if_ephemeral()
+        return {"ok": False, "notes": [f"setBreakpoints failed: {exc}"]}
+
+    session.ensure_disconnected_if_ephemeral()
+    notes = []
+    if not bp.verified:
+        notes.append("Breakpoint not yet verified by debugpy. It may resolve when the module is loaded.")
+    remote_file = session.to_remote_path(file)
+    if remote_file != file:
+        notes.append(f"Path mapped to remote: {remote_file}")
+    return {
+        "ok": True, "id": bp.internal_id, "file": file, "line": line,
+        "verified": bp.verified, "condition": condition, "notes": notes,
+    }
+
+
+@mcp.tool()
+def debugpy_remove_breakpoint(
+    breakpoint_id: str,
+    host: str = "localhost",
+    port: int = DEFAULT_PORT,
+) -> dict[str, Any]:
+    """Remove a breakpoint by its ID (returned from debugpy_set_breakpoint)."""
+    try:
+        session = _require_session(host, port)
+    except ToolError as exc:
+        return {"ok": False, "notes": [str(exc)]}
+
+    bp = next((b for b in session.breakpoints if b.internal_id == breakpoint_id), None)
+    if bp is None:
+        session.ensure_disconnected_if_ephemeral()
+        return {"ok": False, "notes": [f"No breakpoint with id '{breakpoint_id}'."]}
+
+    affected_file = bp.file
+    session.breakpoints.remove(bp)
+
+    try:
+        _send_breakpoints_for_file(session, affected_file)
+    except Exception as exc:
+        session.ensure_disconnected_if_ephemeral()
+        return {"ok": False, "notes": [f"Failed to update breakpoints after removal: {exc}"]}
+
+    session.ensure_disconnected_if_ephemeral()
+    return {"ok": True, "notes": [f"Breakpoint {breakpoint_id} removed."]}
+
+
+@mcp.tool()
+def debugpy_list_breakpoints(host: str = "localhost", port: int = DEFAULT_PORT) -> dict[str, Any]:
+    """List all registered breakpoints for this session."""
+    try:
+        session = _get_session(host, port)
+    except ToolError as exc:
+        return {"ok": False, "notes": [str(exc)]}
+    return {
+        "ok": True,
+        "breakpoints": [bp.to_dict() for bp in session.breakpoints],
+        "notes": [f"{len(session.breakpoints)} breakpoint(s) registered."],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Inspection
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def debugpy_threads(host: str = "localhost", port: int = DEFAULT_PORT) -> dict[str, Any]:
+    """List active threads and stack frames. Stopped threads include full stack traces."""
+    try:
+        session = _require_session(host, port)
+    except ToolError as exc:
+        return {"ok": False, "notes": [str(exc)]}
+
+    try:
+        threads_resp = session._request("threads")
+    except Exception as exc:
+        session.ensure_disconnected_if_ephemeral()
+        return {"ok": False, "notes": [f"DAP threads error: {exc}"]}
+
+    threads_out = []
+    for t in threads_resp.get("body", {}).get("threads", []):
+        tid = t["id"]
+        entry: dict[str, Any] = {"id": tid, "name": t.get("name", ""), "frames": []}
+        # Attempt stackTrace; will fail for running threads — that's fine
+        try:
+            st_resp = session._request("stackTrace", {"threadId": tid, "startFrame": 0, "levels": 20}, timeout=5.0)
+            for frame in st_resp.get("body", {}).get("stackFrames", []):
+                src = frame.get("source", {})
+                remote_path = src.get("path", "")
+                entry["frames"].append({
+                    "id": frame["id"],
+                    "name": frame.get("name", ""),
+                    "file": session.to_local_path(remote_path),
+                    "line": frame.get("line"),
+                })
+        except Exception:
+            entry["frames"] = []
+        threads_out.append(entry)
+
+    session.ensure_disconnected_if_ephemeral()
+    return {"ok": True, "threads": threads_out, "notes": []}
+
+
+@mcp.tool()
+def debugpy_variables(
+    host: str = "localhost",
+    port: int = DEFAULT_PORT,
+    frame_id: int | None = None,
+    scope: str = "locals",
+) -> dict[str, Any]:
+    """Inspect variables in a stopped frame.
+
+    scope: 'locals' or 'globals' (case-insensitive match against DAP scope names).
+    frame_id defaults to the current stopped frame.
+    """
+    try:
+        session = _require_session(host, port)
+    except ToolError as exc:
+        return {"ok": False, "notes": [str(exc)]}
+
+    fid = frame_id
+    if fid is None:
+        with session._state_lock:
+            fid = session.stopped_frame_id
+    if fid is None:
+        session.ensure_disconnected_if_ephemeral()
+        return {"ok": False, "notes": ["No stopped frame. Pause the process or hit a breakpoint first."]}
+
+    try:
+        scopes_resp = session._request("scopes", {"frameId": fid})
+        scopes = scopes_resp.get("body", {}).get("scopes", [])
+        matched = next(
+            (s for s in scopes if s.get("name", "").lower() == scope.lower()),
+            None,
+        )
+        if matched is None:
+            available = [s.get("name") for s in scopes]
+            session.ensure_disconnected_if_ephemeral()
+            return {"ok": False, "notes": [f"Scope '{scope}' not found. Available: {available}"]}
+
+        vars_resp = session._request("variables", {"variablesReference": matched["variablesReference"]})
+        variables = [
+            {"name": v["name"], "value": v.get("value", ""), "type": v.get("type", "")}
+            for v in vars_resp.get("body", {}).get("variables", [])
+        ]
+    except Exception as exc:
+        session.ensure_disconnected_if_ephemeral()
+        return {"ok": False, "notes": [f"DAP error: {exc}", "Frame ID may be stale — call debugpy_threads for fresh IDs."]}
+
+    session.ensure_disconnected_if_ephemeral()
+    return {"ok": True, "frame_id": fid, "scope": scope, "variables": variables, "notes": []}
+
+
+@mcp.tool()
+def debugpy_evaluate(
+    expression: str,
+    host: str = "localhost",
+    port: int = DEFAULT_PORT,
+    frame_id: int | None = None,
+    context: str = "watch",
+) -> dict[str, Any]:
+    """Evaluate a watch expression or REPL snippet.
+
+    context: 'watch' (read-only style), 'repl' (can have side effects), or 'hover'.
+    frame_id defaults to the current stopped frame.
+    """
+    try:
+        session = _require_session(host, port)
+    except ToolError as exc:
+        return {"ok": False, "notes": [str(exc)]}
+
+    fid = frame_id
+    if fid is None:
+        with session._state_lock:
+            fid = session.stopped_frame_id
+
+    args: dict[str, Any] = {"expression": expression, "context": context}
+    if fid is not None:
+        args["frameId"] = fid
+
+    try:
+        resp = session._request("evaluate", args)
+    except Exception as exc:
+        session.ensure_disconnected_if_ephemeral()
+        return {"ok": False, "notes": [f"DAP error: {exc}", "Frame ID may be stale — call debugpy_threads."]}
+
+    session.ensure_disconnected_if_ephemeral()
+    if not resp.get("success"):
+        return {
+            "ok": False,
+            "expression": expression,
+            "notes": [resp.get("message", "Evaluation failed."), "Ensure the process is stopped at a breakpoint."],
+        }
+    body = resp.get("body", {})
+    return {
+        "ok": True,
+        "expression": expression,
+        "result": body.get("result"),
+        "type": body.get("type"),
+        "notes": [],
+    }
 
 
 def main() -> None:
